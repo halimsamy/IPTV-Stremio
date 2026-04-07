@@ -11,8 +11,6 @@
     const epgInput       = document.getElementById('epgUrl');
     const enableEpgChk   = document.getElementById('enableEpg');
     const epgOffsetInput = document.getElementById('epgOffsetHours');
-    const debugChk       = document.getElementById('debugMode');
-
     const {
         showOverlay,
         hideOverlay,
@@ -26,6 +24,10 @@
     if (!window.ConfigureCommon) {
         console.error('[DIRECT-CONFIG] ConfigureCommon not loaded.');
         return;
+    }
+
+    if (typeof window.ConfigureCommon.prefillIfReconfigure === 'function') {
+        window.ConfigureCommon.prefillIfReconfigure('direct');
     }
 
     function validateUrl(u) {
@@ -138,8 +140,6 @@
         const enableEpgInitial = enableEpgChk.checked;
         const epgUrl = epgInput.value.trim();
         const epgOffsetHours = epgOffsetInput.value ? parseFloat(epgOffsetInput.value) : 0;
-        const debug = !!(debugChk && debugChk.checked);
-
         if (!validateUrl(m3uUrl)) {
             alert('Invalid M3U URL');
             return;
@@ -155,8 +155,6 @@
         appendDetail('== PRE-FLIGHT CHECKS ==');
         appendDetail(`M3U URL: ${m3uUrl}`);
         if (enableEpgInitial && epgUrl) appendDetail(`EPG URL: ${epgUrl}`);
-        appendDetail(`Debug logging: ${debug ? 'enabled' : 'disabled'}`);
-
         let enableEpgFinal = enableEpgInitial;
         try {
             // 1. Fetch Playlist
@@ -215,8 +213,7 @@
             const config = {
                 provider: 'direct',
                 m3uUrl,
-                enableEpg: enableEpgFinal,
-                debug: debug || undefined
+                enableEpg: enableEpgFinal
             };
             if (enableEpgFinal && epgUrl) config.epgUrl = epgUrl;
             if (isFinite(epgOffsetHours) && epgOffsetHours !== 0) config.epgOffsetHours = epgOffsetHours;

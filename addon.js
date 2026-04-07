@@ -4,6 +4,7 @@ require('dotenv').config();
 
 const { addonBuilder } = require("stremio-addon-sdk");
 const crypto = require("crypto");
+const { version: ADDON_VERSION } = require('./package.json');
 const LRUCache = require("./lruCache");
 const fetch = require('node-fetch');
 
@@ -26,6 +27,13 @@ if (process.env.REDIS_URL) {
 
 const ADDON_NAME = "M3U/EPG TV Addon";
 const ADDON_ID = "org.stremio.m3u-epg-addon";
+const BASE_CATALOG_EXTRAS = Object.freeze(['genre', 'skip']);
+const DYNAMIC_CATALOG_PREFIX = Object.freeze({
+    movie: 'iptv_movie_group_',
+    series: 'iptv_series_group_'
+});
+const DEFAULT_HOME_CATEGORY_CATALOG_LIMIT = 0;
+const MAX_HOME_CATEGORY_CATALOG_LIMIT = 24;
 
 const DEBUG_ENV = (process.env.DEBUG_MODE || '').toLowerCase() === 'true';
 
@@ -36,14 +44,28 @@ const ALL_GENRE_LABELS = new Set([
     'all series'
 ]);
 
+const ARABIC_DIGIT_MAP = Object.freeze({
+    '٠': '0', '١': '1', '٢': '2', '٣': '3', '٤': '4',
+    '٥': '5', '٦': '6', '٧': '7', '٨': '8', '٩': '9',
+    '۰': '0', '۱': '1', '۲': '2', '۳': '3', '۴': '4',
+    '۵': '5', '۶': '6', '۷': '7', '۸': '8', '۹': '9'
+});
+
 function normalizeSearchText(value) {
     return (value || '')
         .toString()
         .normalize('NFKD')
+        .replace(/[٠-٩۰-۹]/g, digit => ARABIC_DIGIT_MAP[digit] || digit)
+        .replace(/[\u0640\u200c\u200d]/g, '')
         .replace(/\p{M}/gu, '')
-        .replace(/[أإآ]/g, 'ا')
+        .replace(/[أإآٱ]/g, 'ا')
+        .replace(/ؤ/g, 'و')
+        .replace(/ئ/g, 'ي')
         .replace(/ة/g, 'ه')
         .replace(/ى/g, 'ي')
+        .replace(/ء/g, '')
+        .replace(/([\p{L}])(\p{N})/gu, '$1 $2')
+        .replace(/(\p{N})(\p{L})/gu, '$1 $2')
         .replace(/[^\p{L}\p{N}]+/gu, ' ')
         .trim()
         .toLowerCase();
@@ -67,6 +89,149 @@ function normalizeReleasedValue(value, fallbackYear) {
     const year = extractYear(fallbackYear);
     if (year) return `${year}-01-01T00:00:00.000Z`;
     return '1970-01-01T00:00:00.000Z';
+}
+
+function normalizeAssetUrl(value) {
+    if (!value || typeof value !== 'string') return value || undefined;
+
+    try {
+        const url = new URL(value);
+        if (url.protocol !== 'http:') return value;
+
+        const host = url.hostname.toLowerCase();
+        if (host === 'images.vega-xt-mh.com') {
+            url.protocol = 'https:';
+            if (url.port === '80') url.port = '';
+            return url.toString();
+        }
+    } catch {
+        return value;
+    }
+
+    return value;
+}
+
+function stripNullishDeep(value) {
+    if (Array.isArray(value)) {
+        return value
+            .map(stripNullishDeep)
+            .filter(item => item !== undefined);
+    }
+
+    if (value && typeof value === 'object') {
+        const cleaned = {};
+        for (const [key, entry] of Object.entries(value)) {
+            const normalized = stripNullishDeep(entry);
+            if (normalized !== undefined) cleaned[key] = normalized;
+        }
+        return cleaned;
+    }
+
+    if (value === null || typeof value === 'undefined') return undefined;
+    return value;
+}
+
+function getItemGroupLabel(item, fallbackLabel) {
+    const raw = item?.category || item?.attributes?.['group-title'];
+    const label = String(raw || '').trim();
+    return label || fallbackLabel;
+}
+
+function buildDynamicCatalogId(type, label) {
+    const prefix = DYNAMIC_CATALOG_PREFIX[type];
+    if (!prefix) return '';
+    const digest = crypto.createHash('md5').update(`${type}:${label}`).digest('hex').slice(0, 12);
+    return `${prefix}${digest}`;
+}
+
+function getItemFreshnessValue(item) {
+    const candidate = item?.addedAt || item?.released || item?.releaseDate;
+    if (!candidate) return 0;
+
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) return candidate;
+
+    const raw = String(candidate).trim();
+    if (!raw) return 0;
+    if (/^\d{10}$/.test(raw)) return parseInt(raw, 10) * 1000;
+    if (/^\d{13}$/.test(raw)) return parseInt(raw, 10);
+
+    const parsed = Date.parse(raw);
+    return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function normalizeHomeCategoryCatalogLimit(value) {
+    if (value === null || typeof value === 'undefined' || value === '') {
+        return DEFAULT_HOME_CATEGORY_CATALOG_LIMIT;
+    }
+
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_HOME_CATEGORY_CATALOG_LIMIT;
+    return Math.min(parsed, MAX_HOME_CATEGORY_CATALOG_LIMIT);
+}
+
+function getFuzzyDistanceLimit(term) {
+    const len = (term || '').length;
+    if (len < 5) return 0;
+    if (len < 9) return 1;
+    return 2;
+}
+
+function boundedLevenshtein(a, b, maxDistance) {
+    if (a === b) return 0;
+    const aLen = a.length;
+    const bLen = b.length;
+    if (Math.abs(aLen - bLen) > maxDistance) return maxDistance + 1;
+    if (!aLen) return bLen <= maxDistance ? bLen : maxDistance + 1;
+    if (!bLen) return aLen <= maxDistance ? aLen : maxDistance + 1;
+
+    let previous = Array.from({ length: bLen + 1 }, (_, idx) => idx);
+    for (let i = 1; i <= aLen; i++) {
+        let current = [i];
+        let minInRow = current[0];
+        for (let j = 1; j <= bLen; j++) {
+            const substitutionCost = a[i - 1] === b[j - 1] ? 0 : 1;
+            const value = Math.min(
+                previous[j] + 1,
+                current[j - 1] + 1,
+                previous[j - 1] + substitutionCost
+            );
+            current[j] = value;
+            if (value < minInRow) minInRow = value;
+        }
+        if (minInRow > maxDistance) return maxDistance + 1;
+        previous = current;
+    }
+    return previous[bLen];
+}
+
+function tokenMatchesApproximately(term, candidateTokens) {
+    const maxDistance = getFuzzyDistanceLimit(term);
+    if (maxDistance === 0) return false;
+
+    return candidateTokens.some(token => boundedLevenshtein(term, token, maxDistance) <= maxDistance);
+}
+
+function hasArabicScript(value) {
+    return /[\u0600-\u06FF]/.test(value || '');
+}
+
+function stripArabicArticle(value) {
+    return (value || '').replace(/^ال+/u, '');
+}
+
+function normalizeTokenForSearch(value) {
+    if (!value) return '';
+    return hasArabicScript(value) ? stripArabicArticle(value) : value;
+}
+
+function tokenMatchesSearchTerm(token, term) {
+    const normalizedToken = normalizeTokenForSearch(token);
+    const normalizedTerm = normalizeTokenForSearch(term);
+    if (!normalizedToken || !normalizedTerm) return false;
+    if (normalizedToken === normalizedTerm) return true;
+    if (normalizedToken.startsWith(normalizedTerm)) return true;
+    if (!hasArabicScript(normalizedTerm) && normalizedToken.includes(normalizedTerm)) return true;
+    return false;
 }
 
 function makeLogger(cfgDebug) {
@@ -116,7 +281,8 @@ function createCacheKey(config) {
         xtreamUseM3U: !!config.xtreamUseM3U,
         xtreamOutput: config.xtreamOutput,
         epgOffsetHours: config.epgOffsetHours,
-        includeSeries: config.includeSeries !== false // default true
+        includeSeries: config.includeSeries !== false, // default true
+        homeCategoryCatalogLimit: normalizeHomeCategoryCatalogLimit(config.homeCategoryCatalogLimit)
     };
     return crypto.createHash('md5').update(stableStringify(minimal)).digest('hex');
 }
@@ -139,6 +305,7 @@ class M3UEPGAddon {
             movie: [],
             series: []
         };
+        this.catalogGenreLookup = new Map();
         this.seriesInfoCache = new Map(); // seriesId -> { videos: [...], fetchedAt }
         this.epgData = {};
         this.lastUpdate = 0;
@@ -158,12 +325,14 @@ class M3UEPGAddon {
             this.config.epgOffsetHours = 0;
         if (typeof this.config.includeSeries === 'undefined')
             this.config.includeSeries = true;
+        this.config.homeCategoryCatalogLimit = normalizeHomeCategoryCatalogLimit(this.config.homeCategoryCatalogLimit);
 
         this.log.debug('Addon instance created', {
             provider: this.providerName,
             cacheKey: this.cacheKey,
             epgOffsetHours: this.config.epgOffsetHours,
-            includeSeries: this.config.includeSeries
+            includeSeries: this.config.includeSeries,
+            homeCategoryCatalogLimit: this.config.homeCategoryCatalogLimit
         });
     }
 
@@ -177,16 +346,19 @@ class M3UEPGAddon {
             const haystack = [
                 item.name,
                 item.category,
-                item.plot,
-                item.attributes?.['group-title'],
-                item.attributes?.['plot']
+                item.attributes?.['group-title']
             ].map(normalizeSearchText).filter(Boolean).join(' ');
+            const haystackTokens = haystack.split(' ').filter(Boolean);
             return {
                 item,
                 name: nameNorm,
                 nameTokens: nameNorm.split(' ').filter(Boolean),
                 haystack,
-                haystackTokens: haystack.split(' ').filter(Boolean)
+                haystackTokens,
+                searchTokens: Array.from(new Set([
+                    ...nameNorm.split(' ').filter(Boolean),
+                    ...haystackTokens
+                ]))
             };
         });
 
@@ -237,9 +409,83 @@ class M3UEPGAddon {
 
     buildGenresInManifest() {
         if (!this.manifestRef) return;
-        const tvCatalog = this.manifestRef.catalogs.find(c => c.id === 'iptv_channels');
-        const movieCatalog = this.manifestRef.catalogs.find(c => c.id === 'iptv_movies');
-        const seriesCatalog = this.manifestRef.catalogs.find(c => c.id === 'iptv_series');
+        const previousCatalogs = Array.isArray(this.manifestRef.catalogs) ? this.manifestRef.catalogs : [];
+        const applyGenreOptions = (catalog, genres) => {
+            if (!catalog || !Array.isArray(catalog.extra)) return;
+            const genreExtra = catalog.extra.find(entry => entry && entry.name === 'genre');
+            if (genreExtra) genreExtra.options = genres.slice();
+        };
+        const tvCatalog = previousCatalogs.find(c => c.id === 'iptv_channels') || {
+            type: 'tv',
+            id: 'iptv_channels',
+            name: 'IPTV Channels',
+            extra: BASE_CATALOG_EXTRAS.map(extraName => ({ name: extraName })),
+            extraSupported: BASE_CATALOG_EXTRAS.slice(),
+            extraRequired: [],
+            genres: []
+        };
+        const searchCatalog = previousCatalogs.find(c => c.id === 'iptv_movies_search') || {
+            type: 'all',
+            id: 'iptv_movies_search',
+            name: 'IPTV Search',
+            extra: [{ name: 'search', isRequired: true }],
+            extraSupported: ['search'],
+            extraRequired: ['search']
+        };
+        const movieBrowseCatalog = previousCatalogs.find(c => c.id === 'iptv_movies') || {
+            type: 'movie',
+            id: 'iptv_movies',
+            name: 'IPTV Movies',
+            extra: BASE_CATALOG_EXTRAS.map(extraName => ({ name: extraName })),
+            extraSupported: BASE_CATALOG_EXTRAS.slice(),
+            extraRequired: [],
+            genres: []
+        };
+        const seriesBrowseCatalog = previousCatalogs.find(c => c.id === 'iptv_series') || {
+            type: 'series',
+            id: 'iptv_series',
+            name: 'IPTV Series',
+            extra: BASE_CATALOG_EXTRAS.map(extraName => ({ name: extraName })),
+            extraSupported: BASE_CATALOG_EXTRAS.slice(),
+            extraRequired: [],
+            genres: []
+        };
+
+        const buildCategoryCatalogs = (type, items, fallbackLabel) => {
+            const stats = new Map();
+
+            for (const item of items) {
+                const label = getItemGroupLabel(item, fallbackLabel);
+                if (!label) continue;
+                const freshness = getItemFreshnessValue(item);
+                const existing = stats.get(label) || { label, freshness: 0, count: 0 };
+                existing.freshness = Math.max(existing.freshness, freshness);
+                existing.count += 1;
+                stats.set(label, existing);
+            }
+
+            return Array.from(stats.values())
+                .sort((a, b) =>
+                    b.freshness - a.freshness ||
+                    b.count - a.count ||
+                    a.label.localeCompare(b.label)
+                )
+                .slice(0, this.config.homeCategoryCatalogLimit)
+                .map(({ label }) => {
+                    const id = buildDynamicCatalogId(type, label);
+                    this.catalogGenreLookup.set(id, { type, genre: label });
+                    return {
+                        type,
+                        id,
+                        name: label,
+                        extra: [{ name: 'skip' }],
+                        extraSupported: ['skip'],
+                        extraRequired: []
+                    };
+                });
+        };
+
+        this.catalogGenreLookup = new Map();
 
         if (tvCatalog) {
             const groups = [
@@ -252,38 +498,48 @@ class M3UEPGAddon {
             ].sort((a, b) => a.localeCompare(b));
             if (!groups.includes('All Channels')) groups.unshift('All Channels');
             tvCatalog.genres = groups;
+            applyGenreOptions(tvCatalog, groups);
         }
 
-        if (movieCatalog) {
-            const movieGroups = [
-                ...new Set(
-                    this.movies
-                        .map(c => c.category || c.attributes?.['group-title'])
-                        .filter(Boolean)
-                        .map(s => s.trim())
-                )
-            ].sort((a, b) => a.localeCompare(b));
-            if (!movieGroups.includes('All Movies')) movieGroups.unshift('All Movies');
-            movieCatalog.genres = movieGroups;
-        }
+        const movieGroups = [
+            ...new Set(
+                this.movies
+                    .map(item => getItemGroupLabel(item, 'Other Movies'))
+                    .filter(Boolean)
+                    .map(label => label.trim())
+            )
+        ].sort((a, b) => a.localeCompare(b));
+        if (!movieGroups.includes('All Movies')) movieGroups.unshift('All Movies');
+        movieBrowseCatalog.genres = movieGroups;
+        applyGenreOptions(movieBrowseCatalog, movieGroups);
 
-        if (seriesCatalog) {
-            const seriesGroups = [
-                ...new Set(
-                    this.series
-                        .map(c => c.category || c.attributes?.['group-title'])
-                        .filter(Boolean)
-                        .map(s => s.trim())
-                )
-            ].sort((a, b) => a.localeCompare(b));
-            if (!seriesGroups.includes('All Series')) seriesGroups.unshift('All Series');
-            seriesCatalog.genres = seriesGroups;
-        }
+        const seriesGroups = [
+            ...new Set(
+                this.series
+                    .map(item => getItemGroupLabel(item, 'Other Series'))
+                    .filter(Boolean)
+                    .map(label => label.trim())
+            )
+        ].sort((a, b) => a.localeCompare(b));
+        if (!seriesGroups.includes('All Series')) seriesGroups.unshift('All Series');
+        seriesBrowseCatalog.genres = seriesGroups;
+        applyGenreOptions(seriesBrowseCatalog, seriesGroups);
+
+        const movieCatalogs = buildCategoryCatalogs('movie', this.movies, 'Other Movies');
+        const seriesCatalogs = buildCategoryCatalogs('series', this.series, 'Other Series');
+
+        previousCatalogs.splice(0, previousCatalogs.length,
+            tvCatalog,
+            movieBrowseCatalog,
+            ...movieCatalogs,
+            ...(this.config.includeSeries !== false ? [seriesBrowseCatalog, ...seriesCatalogs] : []),
+            searchCatalog
+        );
 
         this.log.debug('Catalog genres built', {
             tvGenres: tvCatalog?.genres?.length || 0,
-            movieGenres: movieCatalog?.genres?.length || 0,
-            seriesGenres: seriesCatalog?.genres?.length || 0
+            movieGenres: movieCatalogs.length,
+            seriesGenres: this.config.includeSeries !== false ? seriesCatalogs.length : 0
         });
     }
 
@@ -298,13 +554,20 @@ class M3UEPGAddon {
             .map(normalizeSearchText).filter(Boolean).join(' ');
         return this.matchesSearchEntry({
             item, name: nameNorm, nameTokens: nameNorm.split(' ').filter(Boolean),
-            haystack, haystackTokens: haystack.split(' ').filter(Boolean)
-        }, normalizeSearchText(rawQuery).split(' ').filter(Boolean));
+            haystack,
+            haystackTokens: haystack.split(' ').filter(Boolean),
+            searchTokens: Array.from(new Set([
+                ...nameNorm.split(' ').filter(Boolean),
+                ...haystack.split(' ').filter(Boolean)
+            ]))
+        }, normalizeSearchText(rawQuery), normalizeSearchText(rawQuery).split(' ').filter(Boolean));
     }
 
-    matchesSearchEntry(entry, queryTerms) {
+    matchesSearchEntry(entry, query, queryTerms) {
         if (!queryTerms || !queryTerms.length) return true;
-        return queryTerms.every(term => entry.haystack.includes(term));
+        if (queryTerms.length > 1 && entry.name.includes(query)) return true;
+        if (queryTerms.every(term => entry.searchTokens.some(token => tokenMatchesSearchTerm(token, term)))) return true;
+        return queryTerms.every(term => tokenMatchesApproximately(term, entry.nameTokens));
     }
 
     rankSearchResult(item, rawQuery) {
@@ -328,8 +591,8 @@ class M3UEPGAddon {
         if (haystack === query) return 1;
         if (name.startsWith(query)) return 2;
         
-        if (terms.every(term => nameTokens.includes(term))) return 3;
-        if (terms.every(term => haystackTokens.includes(term))) return 4;
+        if (terms.every(term => nameTokens.some(token => tokenMatchesSearchTerm(token, term)))) return 3;
+        if (terms.every(term => haystackTokens.some(token => tokenMatchesSearchTerm(token, term)))) return 4;
         if (terms.every(term => name.includes(term))) return 5;
         if (terms.every(term => haystack.includes(term))) return 6;
         
@@ -581,13 +844,13 @@ class M3UEPGAddon {
             meta.description = current
                 ? `📡 Now: ${current.title}${current.description ? `\n${current.description}` : ''}`
                 : '📡 Live Channel';
-            meta.poster = this.deriveFallbackLogoUrl(item);
+            meta.poster = normalizeAssetUrl(this.deriveFallbackLogoUrl(item));
             meta.genres = item.category
                 ? [item.category]
                 : (item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Live TV']);
             meta.runtime = 'Live';
         } else if (item.type === 'movie') {
-            meta.poster = item.poster ||
+            meta.poster = normalizeAssetUrl(item.poster) ||
                 item.attributes?.['tvg-logo'] ||
                 `https://via.placeholder.com/300x450/CC6600/FFFFFF?text=${encodeURIComponent(item.name)}`;
             meta.year = item.year;
@@ -598,7 +861,7 @@ class M3UEPGAddon {
             meta.description = item.plot || item.attributes?.['plot'] || `Movie: ${item.name}`;
             meta.genres = item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Movie'];
         } else if (item.type === 'series') {
-            meta.poster = item.poster ||
+            meta.poster = normalizeAssetUrl(item.poster) ||
                 item.attributes?.['tvg-logo'] ||
                 `https://via.placeholder.com/300x450/3366CC/FFFFFF?text=${encodeURIComponent(item.name)}`;
             meta.description = item.plot || item.attributes?.['plot'] || 'Series / Show';
@@ -606,7 +869,7 @@ class M3UEPGAddon {
                 ? [item.category]
                 : (item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Series']);
         }
-        return meta;
+        return stripNullishDeep(meta);
     }
 
     getStream(id) {
@@ -660,25 +923,25 @@ class M3UEPGAddon {
             season: v.season,
             episode: v.episode,
             released: normalizeReleasedValue(v.released, fallbackReleaseYear),
-            thumbnail: v.thumbnail || seriesItem.poster || seriesItem.attributes?.['tvg-logo']
-        }));
+            thumbnail: normalizeAssetUrl(v.thumbnail || seriesItem.poster || seriesItem.attributes?.['tvg-logo'])
+        })).map(stripNullishDeep);
 
-        return {
+        return stripNullishDeep({
             id: seriesItem.id,
             type: 'series',
             name: seriesItem.name,
-            poster: seriesItem.poster ||
-                seriesInfo.cover ||
+            poster: normalizeAssetUrl(seriesItem.poster) ||
+                normalizeAssetUrl(seriesInfo.cover) ||
                 seriesItem.attributes?.['tvg-logo'] ||
                 `https://via.placeholder.com/300x450/3366CC/FFFFFF?text=${encodeURIComponent(seriesItem.name)}`,
-            background: backdrop || undefined,
+            background: normalizeAssetUrl(backdrop) || undefined,
             description: seriesItem.plot || seriesInfo.plot || seriesItem.attributes?.['plot'] || 'Series / Show',
             genres: seriesItem.category
                 ? [seriesItem.category]
                 : (seriesItem.attributes?.['group-title'] ? [seriesItem.attributes['group-title']] : ['Series']),
             releaseInfo: seriesInfo.releaseDate ? String(seriesInfo.releaseDate).slice(0, 4) : undefined,
             videos
-        };
+        });
     }
 
     async getDetailedMetaAsync(id, type) {
@@ -716,7 +979,7 @@ class M3UEPGAddon {
                 id: item.id,
                 type: 'tv',
                 name: item.name,
-                poster: this.deriveFallbackLogoUrl(item),
+                poster: normalizeAssetUrl(this.deriveFallbackLogoUrl(item)),
                 description,
                 genres: item.category
                     ? [item.category]
@@ -730,50 +993,50 @@ class M3UEPGAddon {
                 if (m) year = parseInt(m[1]);
             }
             const description = item.plot || item.attributes?.['plot'] || `Movie: ${item.name}`;
-            return {
+            return stripNullishDeep({
                 id: item.id,
                 type: 'movie',
                 name: item.name,
-                poster: item.poster || item.attributes?.['tvg-logo'] ||
+                poster: normalizeAssetUrl(item.poster || item.attributes?.['tvg-logo']) ||
                     `https://via.placeholder.com/300x450/CC6600/FFFFFF?text=${encodeURIComponent(item.name)}`,
                 description,
                 genres: item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Movie'],
                 year
-            };
+            });
         }
     }
 }
 
 async function createAddon(config) {
+    const buildCatalogManifest = (type, id, name, { searchOnly = false } = {}) => {
+        const extra = searchOnly
+            ? [{ name: 'search', isRequired: true }]
+            : BASE_CATALOG_EXTRAS.map(extraName => ({ name: extraName }));
+
+        return {
+            type,
+            id,
+            name,
+            extra,
+            // Compatibility with clients/examples that still look for the legacy fields.
+            extraSupported: searchOnly ? ['search'] : BASE_CATALOG_EXTRAS.slice(),
+            extraRequired: searchOnly ? ['search'] : [],
+            genres: searchOnly ? undefined : []
+        };
+    };
+
     const manifest = {
         id: ADDON_ID,
-        version: "2.0.0",
+        version: ADDON_VERSION,
         name: ADDON_NAME,
         description: "IPTV addon (M3U / EPG / Xtream) with encrypted configs, caching & series support (Xtream + Direct)",
         resources: ["catalog", "stream", "meta"],
         types: ["tv", "movie", "series"],
         catalogs: [
-            {
-                type: 'tv',
-                id: 'iptv_channels',
-                name: 'IPTV Channels',
-                extra: [{ name: 'search' }, { name: 'genre' }, { name: 'skip' }],
-                genres: []
-            },
-            {
-                type: 'movie',
-                id: 'iptv_movies',
-                name: 'IPTV Movies',
-                extra: [{ name: 'search' }, { name: 'genre' }, { name: 'skip' }],
-                genres: []
-            },
-            {
-                type: 'series',
-                id: 'iptv_series',
-                name: 'IPTV Series',
-                extra: [{ name: 'search' }, { name: 'genre' }, { name: 'skip' }],
-                genres: []
-            }
+            buildCatalogManifest('tv', 'iptv_channels', 'IPTV Channels'),
+            buildCatalogManifest('movie', 'iptv_movies', 'IPTV Movies'),
+            buildCatalogManifest('series', 'iptv_series', 'IPTV Series'),
+            buildCatalogManifest('all', 'iptv_movies_search', 'IPTV Search', { searchOnly: true })
         ],
         idPrefixes: ["iptv_"],
         behaviorHints: {
@@ -814,11 +1077,22 @@ async function createAddon(config) {
             try {
                 addonInstance.updateData().catch(() => { });
                 let items = [];
-                if (args.type === 'tv' && args.id === 'iptv_channels') {
+                const requestedCatalogId = String(args.id || '');
+                const catalogId = requestedCatalogId.endsWith('_search')
+                    ? requestedCatalogId.slice(0, -7)
+                    : requestedCatalogId;
+                const dynamicCatalogMatch = addonInstance.catalogGenreLookup.get(requestedCatalogId);
+
+                if (args.type === 'tv' && catalogId === 'iptv_channels') {
                     items = addonInstance.channels;
-                } else if (args.type === 'movie' && args.id === 'iptv_movies') {
+                } else if (dynamicCatalogMatch && dynamicCatalogMatch.type === args.type) {
+                    const sourceItems = args.type === 'movie'
+                        ? addonInstance.movies
+                        : addonInstance.series;
+                    items = sourceItems.filter(item => getItemGroupLabel(item, '') === dynamicCatalogMatch.genre);
+                } else if (args.type === 'movie' && catalogId === 'iptv_movies') {
                     items = addonInstance.movies;
-                } else if (args.type === 'series' && args.id === 'iptv_series') {
+                } else if (args.type === 'series' && catalogId === 'iptv_series') {
                     if (addonInstance.config.includeSeries !== false)
                         items = addonInstance.series;
                 }
@@ -830,29 +1104,45 @@ async function createAddon(config) {
                     );
                 }
                 if (extra.search) {
-                    const searchBucket = args.type === 'tv'
-                        ? addonInstance.searchIndex.tv
-                        : args.type === 'movie'
-                            ? addonInstance.searchIndex.movie
-                            : addonInstance.searchIndex.series;
-                    
                     const query = normalizeSearchText(extra.search);
                     const terms = query.split(' ').filter(Boolean);
+                    const shouldMergeMovieAndSeriesSearch = requestedCatalogId === 'iptv_movies_search';
+                    const searchBuckets = shouldMergeMovieAndSeriesSearch
+                        ? [
+                            addonInstance.searchIndex.movie,
+                            ...(addonInstance.config.includeSeries !== false ? [addonInstance.searchIndex.series] : [])
+                        ]
+                        : [
+                            args.type === 'tv'
+                                ? addonInstance.searchIndex.tv
+                                : args.type === 'movie'
+                                    ? addonInstance.searchIndex.movie
+                                    : addonInstance.searchIndex.series
+                        ];
 
-                    items = searchBucket
-                        .filter(entry => addonInstance.matchesSearchEntry(entry, terms))
+                    items = searchBuckets
+                        .flat()
+                        .filter(entry => addonInstance.matchesSearchEntry(entry, query, terms))
                         .map(entry => ({
                             entry,
                             rank: addonInstance.rankSearchEntry(entry, query, terms)
                         }))
                         .sort((a, b) =>
                             a.rank - b.rank ||
+                            a.entry.item.type.localeCompare(b.entry.item.type) ||
                             a.entry.item.name.localeCompare(b.entry.item.name)
                         )
                         .map(obj => obj.entry.item);
                 }
                 const skip = Math.max(parseInt(extra.skip || '0', 10) || 0, 0);
-                const metas = items.slice(skip, skip + 100).map(i => addonInstance.generateMetaPreview(i));
+                const metas = items.slice(skip, skip + 100).map(i => {
+                    const meta = addonInstance.generateMetaPreview(i);
+                    if (requestedCatalogId === 'iptv_movies_search' && meta?.name) {
+                        const label = meta.type === 'series' ? 'Series' : meta.type === 'movie' ? 'Movie' : null;
+                        if (label) meta.name = `${meta.name} (${label})`;
+                    }
+                    return meta;
+                });
                 if (addonInstance.config.debug) {
                     console.log('[DEBUG] Catalog handler', {
                         type: args.type,

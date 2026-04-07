@@ -10,6 +10,7 @@ const fetch = require('node-fetch');
 const createAddon = require('./addon');
 const { encryptConfig, tryParseConfigToken } = require('./cryptoConfig');
 const LRUCache = require('./lruCache');
+const { normalizeSdkResourceUrl } = require('./sdkUrlUtils');
 
 const DEBUG = (process.env.DEBUG_MODE || '').toLowerCase() === 'true';
 function dlog(...args) {
@@ -220,6 +221,12 @@ app.use('/:token', async (req, res, next) => {
     if (!isConfigToken(token)) return next('route');
     if (req.path.startsWith('/configure')) return next();
 
+    const originalUrl = req.url;
+    req.url = normalizeSdkResourceUrl(req.url);
+    if (DEBUG && originalUrl !== req.url) {
+        console.log('[DEBUG] Normalized route', { originalUrl, normalizedUrl: req.url });
+    }
+
     let config;
     try {
         config = maybeDecryptConfig(token);
@@ -304,6 +311,36 @@ app.get('/:token/logo/:tvgId.png', async (req, res) => {
 app.use('/:token', (req, res) => {
     const iface = req.addonInterface;
     if (!iface) return res.status(500).json({ error: 'Interface not ready' });
+
+    // Prevent stale client behavior when the manifest shape changes.
+    if (req.path === '/manifest.json') {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+        if (DEBUG) {
+            const searchable = (iface.manifest?.catalogs || [])
+                .filter(c =>
+                    (Array.isArray(c.extra) && c.extra.some(e => e?.name === 'search')) ||
+                    (Array.isArray(c.extraSupported) && c.extraSupported.includes('search'))
+                )
+                .map(c => `${c.type}:${c.id}`);
+            console.log('[DEBUG] Manifest search catalogs', searchable);
+        }
+    }
+
+    if (DEBUG) {
+        const start = Date.now();
+        res.on('finish', () => {
+            console.log('[DEBUG] Routed request', {
+                method: req.method,
+                url: req.originalUrl,
+                normalizedUrl: req.url,
+                status: res.statusCode,
+                ms: Date.now() - start,
+                userAgent: req.headers['user-agent']
+            });
+        });
+    }
 
     const router = getRouter(iface);
     router(req, res, (err) => {

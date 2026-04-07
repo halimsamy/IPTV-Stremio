@@ -15,7 +15,6 @@
     const togglePwdBtn = document.getElementById('togglePwd');
     const enableEpgChk = document.getElementById('enableEpg');
     const epgOffsetInput = document.getElementById('epgOffsetHours');
-    const debugChk = document.getElementById('debugMode');
     const customEpgGroup = document.getElementById('customEpgGroup');
     const customEpgUrlInp = document.getElementById('customEpgUrl');
 
@@ -169,8 +168,6 @@
         const epgMode = enableEpgInitial ? selectedEpgMode() : 'disabled';
         const customEpg = (epgMode === 'custom') ? customEpgUrlInp.value.trim() : '';
         const epgOffset = epgOffsetInput.value ? parseFloat(epgOffsetInput.value) : 0;
-        const debug = !!(debugChk && debugChk.checked);
-
         if (!validateUrl(baseUrl)) {
             alert('Invalid Xtream base URL');
             return;
@@ -202,8 +199,6 @@
         appendDetail(`Base URL: ${baseUrl}`);
         appendDetail(`Mode: 'JSON API'}`);
         appendDetail(`EPG Mode: ${enableEpgInitial ? (epgMode === 'custom' ? 'Custom URL' : 'Panel XMLTV') : 'Disabled'}`);
-        appendDetail(`Debug logging: ${debug ? 'enabled' : 'disabled'}`);
-
         let enableEpgFinal = enableEpgInitial;
         try {
             let liveCount = 0;
@@ -288,8 +283,7 @@
                 xtreamUrl: baseUrl,
                 xtreamUsername: username,
                 xtreamPassword: password,
-                enableEpg: enableEpgFinal,
-                debug: debug || undefined
+                enableEpg: enableEpgFinal
             };
 
             if (enableEpgFinal && epgMode === 'custom' && customEpgUrlInp.value.trim()) {

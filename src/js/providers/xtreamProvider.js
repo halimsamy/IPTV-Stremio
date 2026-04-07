@@ -5,6 +5,45 @@
 // episodes are transformed into Stremio 'videos' (season/episode).
 const fetch = require('node-fetch');
 
+async function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetry(url, options = {}, retries = 2, retryDelayMs = 500) {
+    let lastError = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            const response = await fetch(url, options);
+            if (!response.ok && attempt < retries && response.status >= 500) {
+                await delay(retryDelayMs * (attempt + 1));
+                continue;
+            }
+            return response;
+        } catch (error) {
+            lastError = error;
+            if (attempt >= retries) throw error;
+            await delay(retryDelayMs * (attempt + 1));
+        }
+    }
+    throw lastError;
+}
+
+function normalizeReleased(value) {
+    if (!value) return null;
+    const raw = String(value).trim();
+    if (!raw) return null;
+
+    if (/^\d{10}$/.test(raw)) {
+        return new Date(parseInt(raw, 10) * 1000).toISOString();
+    }
+    if (/^\d{13}$/.test(raw)) {
+        return new Date(parseInt(raw, 10)).toISOString();
+    }
+
+    const parsed = new Date(raw);
+    return Number.isNaN(parsed.getTime()) ? raw : parsed.toISOString();
+}
+
 async function fetchData(addonInstance) {
     const { config } = addonInstance;
     const {
@@ -19,10 +58,10 @@ async function fetchData(addonInstance) {
         throw new Error('Xtream credentials incomplete');
     }
 
-    addonInstance.channels = [];
-    addonInstance.movies = [];
-    if (config.includeSeries !== false) addonInstance.series = [];
-    addonInstance.epgData = {};
+    let nextChannels = [];
+    let nextMovies = [];
+    let nextSeries = config.includeSeries !== false ? [] : addonInstance.series;
+    let nextEpgData = {};
 
     if (xtreamUseM3U) {
         // M3U plus mode (series heuristic limited)
@@ -31,7 +70,7 @@ async function fetchData(addonInstance) {
             `&password=${encodeURIComponent(xtreamPassword)}` +
             `&type=m3u_plus` +
             (xtreamOutput ? `&output=${encodeURIComponent(xtreamOutput)}` : '');
-        const resp = await fetch(url, {
+        const resp = await fetchWithRetry(url, {
             timeout: 30000,
             headers: { 'User-Agent': 'Stremio M3U/EPG Addon (xtreamProvider/m3u)' }
         });
@@ -39,8 +78,8 @@ async function fetchData(addonInstance) {
         const text = await resp.text();
         const items = addonInstance.parseM3U(text);
 
-        addonInstance.channels = items.filter(i => i.type === 'tv');
-        addonInstance.movies = items.filter(i => i.type === 'movie');
+        nextChannels = items.filter(i => i.type === 'tv');
+        nextMovies = items.filter(i => i.type === 'movie');
 
         if (config.includeSeries !== false) {
             const seriesCandidates = items.filter(i => i.type === 'series');
@@ -65,17 +104,17 @@ async function fetchData(addonInstance) {
                     });
                 }
             }
-            addonInstance.series = Array.from(seen.values());
+            nextSeries = Array.from(seen.values());
         }
     } else {
         // JSON API mode
         const base = `${xtreamUrl}/player_api.php?username=${encodeURIComponent(xtreamUsername)}&password=${encodeURIComponent(xtreamPassword)}`;
         // Fetch streams + category lists in parallel to map category_id -> category_name
         const [liveResp, vodResp, liveCatsResp, vodCatsResp] = await Promise.all([
-            fetch(`${base}&action=get_live_streams`, { timeout: 30000 }),
-            fetch(`${base}&action=get_vod_streams`, { timeout: 30000 }),
-            fetch(`${base}&action=get_live_categories`, { timeout: 20000 }).catch(() => null),
-            fetch(`${base}&action=get_vod_categories`, { timeout: 20000 }).catch(() => null)
+            fetchWithRetry(`${base}&action=get_live_streams`, { timeout: 30000 }),
+            fetchWithRetry(`${base}&action=get_vod_streams`, { timeout: 30000 }),
+            fetchWithRetry(`${base}&action=get_live_categories`, { timeout: 20000 }).catch(() => null),
+            fetchWithRetry(`${base}&action=get_vod_categories`, { timeout: 20000 }).catch(() => null)
         ]);
 
         if (!liveResp.ok) throw new Error('Xtream live streams fetch failed');
@@ -108,7 +147,7 @@ async function fetchData(addonInstance) {
             }
         } catch { /* ignore */ }
 
-        addonInstance.channels = (Array.isArray(live) ? live : []).map(s => {
+        nextChannels = (Array.isArray(live) ? live : []).map(s => {
             const cat = liveCatMap[s.category_id] || s.category_name || s.category_id || 'Live';
             return {
                 id: `iptv_live_${s.stream_id}`,
@@ -126,7 +165,7 @@ async function fetchData(addonInstance) {
             };
         });
 
-        addonInstance.movies = (Array.isArray(vod) ? vod : []).map(s => {
+        nextMovies = (Array.isArray(vod) ? vod : []).map(s => {
             const cat = vodCatMap[s.category_id] || s.category_name || 'Movies';
             return {
                 id: `iptv_vod_${s.stream_id}`,
@@ -136,6 +175,7 @@ async function fetchData(addonInstance) {
                 poster: s.stream_icon,
                 plot: s.plot,
                 year: s.releasedate ? new Date(s.releasedate).getFullYear() : null,
+                addedAt: normalizeReleased(s.added || s.releasedate || null),
                 category: cat,
                 attributes: {
                     'tvg-logo': s.stream_icon,
@@ -148,8 +188,8 @@ async function fetchData(addonInstance) {
         if (config.includeSeries !== false) {
             try {
                 const [seriesResp, seriesCatsResp] = await Promise.all([
-                    fetch(`${base}&action=get_series`, { timeout: 35000 }),
-                    fetch(`${base}&action=get_series_categories`, { timeout: 20000 }).catch(() => null)
+                    fetchWithRetry(`${base}&action=get_series`, { timeout: 35000 }),
+                    fetchWithRetry(`${base}&action=get_series_categories`, { timeout: 20000 }).catch(() => null)
                 ]);
                 let seriesCatMap = {};
                 try {
@@ -166,7 +206,7 @@ async function fetchData(addonInstance) {
                 if (seriesResp.ok) {
                     const seriesList = await seriesResp.json();
                     if (Array.isArray(seriesList)) {
-                        addonInstance.series = seriesList.map(s => {
+                        nextSeries = seriesList.map(s => {
                             const cat = seriesCatMap[s.category_id] || s.category_name || 'Series';
                             return {
                                 id: `iptv_series_${s.series_id}`,
@@ -175,6 +215,7 @@ async function fetchData(addonInstance) {
                                 type: 'series',
                                 poster: s.cover,
                                 plot: s.plot,
+                                addedAt: normalizeReleased(s.last_modified || s.releaseDate || null),
                                 category: cat,
                                 attributes: {
                                     'tvg-logo': s.cover,
@@ -199,15 +240,20 @@ async function fetchData(addonInstance) {
             : `${xtreamUrl}/xmltv.php?username=${encodeURIComponent(xtreamUsername)}&password=${encodeURIComponent(xtreamPassword)}`;
 
         try {
-            const epgResp = await fetch(epgSource, { timeout: 45000 });
+            const epgResp = await fetchWithRetry(epgSource, { timeout: 45000 }, 1, 500);
             if (epgResp.ok) {
                 const epgContent = await epgResp.text();
-                addonInstance.epgData = await addonInstance.parseEPG(epgContent);
+                nextEpgData = await addonInstance.parseEPG(epgContent);
             }
         } catch {
             // Ignore EPG errors
         }
     }
+
+    addonInstance.channels = nextChannels;
+    addonInstance.movies = nextMovies;
+    if (config.includeSeries !== false) addonInstance.series = nextSeries;
+    addonInstance.epgData = nextEpgData;
 }
 
 async function fetchSeriesInfo(addonInstance, seriesId) {
@@ -218,7 +264,7 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
 
     const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
     try {
-        const infoResp = await fetch(`${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`, { timeout: 25000 });
+        const infoResp = await fetchWithRetry(`${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`, { timeout: 25000 });
         if (!infoResp.ok) return { videos: [] };
         const infoJson = await infoResp.json();
         const videos = [];
@@ -227,26 +273,30 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
         Object.keys(episodesObj).forEach(seasonKey => {
             const seasonEpisodes = episodesObj[seasonKey];
             if (Array.isArray(seasonEpisodes)) {
-                for (const ep of seasonEpisodes) {
+                seasonEpisodes.forEach((ep, index) => {
                     const epId = ep.id;
                     const container = ep.container_extension || 'mp4';
                     const url = `${config.xtreamUrl}/series/${encodeURIComponent(config.xtreamUsername)}/${encodeURIComponent(config.xtreamPassword)}/${epId}.${container}`;
+                    let season = parseInt(ep.season || seasonKey, 10);
+                    if (!Number.isInteger(season) || season < 1) season = 1;
+                    let episode = parseInt(ep.episode_num || ep.episode || 0, 10);
+                    if (!Number.isInteger(episode) || episode < 1) episode = index + 1;
                     videos.push({
                         id: `iptv_series_ep_${epId}`,
                         title: ep.title || `Episode ${ep.episode_num}`,
-                        season: parseInt(ep.season || seasonKey, 10),
-                        episode: parseInt(ep.episode_num || ep.episode || 0, 10),
-                        released: ep.releasedate || ep.added || null,
+                        season,
+                        episode,
+                        released: normalizeReleased(ep.releasedate || ep.added || null),
                         thumbnail: ep.info?.movie_image || ep.info?.episode_image || ep.info?.cover_big || null,
                         url,
                         stream_id: epId
                     });
-                }
+                });
             }
         });
         // Sort by season then episode
         videos.sort((a, b) => (a.season - b.season) || (a.episode - b.episode));
-        return { videos, fetchedAt: Date.now() };
+        return { videos, fetchedAt: Date.now(), info: infoJson.info || null };
     } catch {
         return { videos: [] };
     }

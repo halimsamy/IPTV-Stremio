@@ -200,6 +200,66 @@
         return { token, manifestUrl, stremioUrl };
     }
 
+    function parseTokenConfigFromLocation() {
+        const segments = window.location.pathname.split('/').filter(Boolean);
+        if (segments.length < 2 || !segments[1].startsWith('configure')) return null;
+
+        const token = decodeURIComponent(segments[0] || '');
+        if (!token || token.startsWith('enc:')) return null;
+
+        try {
+            let base = token.replace(/-/g, '+').replace(/_/g, '/');
+            const padNeeded = (4 - (base.length % 4)) % 4;
+            if (padNeeded) base += '='.repeat(padNeeded);
+            return JSON.parse(decodeURIComponent(escape(atob(base))));
+        } catch {
+            return null;
+        }
+    }
+
+    function setInputValue(id, value) {
+        const element = document.getElementById(id);
+        if (!element || value === null || typeof value === 'undefined') return;
+
+        if (element.type === 'checkbox') {
+            element.checked = !!value;
+            return;
+        }
+
+        element.value = String(value);
+    }
+
+    function prefillIfReconfigure(provider) {
+        const config = parseTokenConfigFromLocation();
+        if (!config || config.provider !== provider) return;
+
+        if (provider === 'xtream') {
+            setInputValue('xtreamUrl', config.xtreamUrl);
+            setInputValue('xtreamUsername', config.xtreamUsername);
+
+            const pwdInput = document.getElementById('xtreamPassword');
+            if (pwdInput && config.xtreamPassword) {
+                pwdInput.value = '********';
+                pwdInput.dataset.original = config.xtreamPassword;
+            }
+
+            setInputValue('enableEpg', config.enableEpg !== false);
+            setInputValue('customEpgUrl', config.epgUrl || '');
+            setInputValue('epgOffsetHours', config.epgOffsetHours || '');
+            const epgMode = config.epgUrl ? 'custom' : 'xtream';
+            const radio = document.querySelector(`input[name="epgMode"][value="${epgMode}"]`);
+            if (radio) radio.checked = true;
+            return;
+        }
+
+        if (provider === 'direct') {
+            setInputValue('m3uUrl', config.m3uUrl);
+            setInputValue('enableEpg', config.enableEpg !== false);
+            setInputValue('epgUrl', config.epgUrl || '');
+            setInputValue('epgOffsetHours', config.epgOffsetHours || '');
+        }
+    }
+
     /* -------- Public API -------- */
 
     window.ConfigureCommon = {
@@ -210,6 +270,7 @@
         overlaySetMessage(msg) { loaderMessage.textContent = msg; },
         setProgress,
         appendDetail,
+        prefillIfReconfigure,
         // For direct-config pre-flight to re-disable if needed
         forceDisableActions: disableActionButtons
     };
