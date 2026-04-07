@@ -6,7 +6,7 @@ echo "Starting cloudflared tunnel to ${TUNNEL_HOSTNAME}..."
 # We use --listener-addr to force IPv4 and match our health check.
 cloudflared access tcp \
   --hostname "${TUNNEL_HOSTNAME}" \
-  --listener-addr 127.0.0.1:8888 \
+  --url localhost:8888 \
   --service-token-id "${CF_CLIENT_ID}" \
   --service-token-secret "${CF_CLIENT_SECRET}" > /tmp/cloudflared.log 2>&1 &
 
