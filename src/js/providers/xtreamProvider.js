@@ -4,16 +4,27 @@
 // - fetchSeriesInfo lazily queries per-series episodes (get_series_info)
 // episodes are transformed into Stremio 'videos' (season/episode).
 const fetch = require('node-fetch');
+const { createProxyAgent } = require('../../../proxyAgent');
 
 async function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function fetchWithRetry(url, options = {}, retries = 2, retryDelayMs = 500) {
+function withProxyFetchOptions(url, options = {}, proxyUrl) {
+    if (!proxyUrl || options.agent) return options;
+
+    return {
+        ...options,
+        agent: createProxyAgent(url, proxyUrl)
+    };
+}
+
+async function fetchWithRetry(url, options = {}, retries = 2, retryDelayMs = 500, proxyUrl = '') {
     let lastError = null;
+    const requestOptions = withProxyFetchOptions(url, options, proxyUrl);
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
-            const response = await fetch(url, options);
+            const response = await fetch(url, requestOptions);
             if (!response.ok && attempt < retries && response.status >= 500) {
                 await delay(retryDelayMs * (attempt + 1));
                 continue;
@@ -50,6 +61,7 @@ async function fetchData(addonInstance) {
         xtreamUrl,
         xtreamUsername,
         xtreamPassword,
+        xtreamProxyUrl,
         xtreamUseM3U,
         xtreamOutput
     } = config;
@@ -73,7 +85,7 @@ async function fetchData(addonInstance) {
         const resp = await fetchWithRetry(url, {
             timeout: 30000,
             headers: { 'User-Agent': 'Stremio M3U/EPG Addon (xtreamProvider/m3u)' }
-        });
+        }, 2, 500, xtreamProxyUrl);
         if (!resp.ok) throw new Error('Xtream M3U fetch failed');
         const text = await resp.text();
         const items = addonInstance.parseM3U(text);
@@ -111,10 +123,10 @@ async function fetchData(addonInstance) {
         const base = `${xtreamUrl}/player_api.php?username=${encodeURIComponent(xtreamUsername)}&password=${encodeURIComponent(xtreamPassword)}`;
         // Fetch streams + category lists in parallel to map category_id -> category_name
         const [liveResp, vodResp, liveCatsResp, vodCatsResp] = await Promise.all([
-            fetchWithRetry(`${base}&action=get_live_streams`, { timeout: 30000 }),
-            fetchWithRetry(`${base}&action=get_vod_streams`, { timeout: 30000 }),
-            fetchWithRetry(`${base}&action=get_live_categories`, { timeout: 20000 }).catch(() => null),
-            fetchWithRetry(`${base}&action=get_vod_categories`, { timeout: 20000 }).catch(() => null)
+            fetchWithRetry(`${base}&action=get_live_streams`, { timeout: 30000 }, 2, 500, xtreamProxyUrl),
+            fetchWithRetry(`${base}&action=get_vod_streams`, { timeout: 30000 }, 2, 500, xtreamProxyUrl),
+            fetchWithRetry(`${base}&action=get_live_categories`, { timeout: 20000 }, 2, 500, xtreamProxyUrl).catch(() => null),
+            fetchWithRetry(`${base}&action=get_vod_categories`, { timeout: 20000 }, 2, 500, xtreamProxyUrl).catch(() => null)
         ]);
 
         if (!liveResp.ok) throw new Error('Xtream live streams fetch failed');
@@ -188,8 +200,8 @@ async function fetchData(addonInstance) {
         if (config.includeSeries !== false) {
             try {
                 const [seriesResp, seriesCatsResp] = await Promise.all([
-                    fetchWithRetry(`${base}&action=get_series`, { timeout: 35000 }),
-                    fetchWithRetry(`${base}&action=get_series_categories`, { timeout: 20000 }).catch(() => null)
+                    fetchWithRetry(`${base}&action=get_series`, { timeout: 35000 }, 2, 500, xtreamProxyUrl),
+                    fetchWithRetry(`${base}&action=get_series_categories`, { timeout: 20000 }, 2, 500, xtreamProxyUrl).catch(() => null)
                 ]);
                 let seriesCatMap = {};
                 try {
@@ -240,7 +252,7 @@ async function fetchData(addonInstance) {
             : `${xtreamUrl}/xmltv.php?username=${encodeURIComponent(xtreamUsername)}&password=${encodeURIComponent(xtreamPassword)}`;
 
         try {
-            const epgResp = await fetchWithRetry(epgSource, { timeout: 45000 }, 1, 500);
+            const epgResp = await fetchWithRetry(epgSource, { timeout: 45000 }, 1, 500, xtreamProxyUrl);
             if (epgResp.ok) {
                 const epgContent = await epgResp.text();
                 nextEpgData = await addonInstance.parseEPG(epgContent);
@@ -264,7 +276,13 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
 
     const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
     try {
-        const infoResp = await fetchWithRetry(`${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`, { timeout: 25000 });
+        const infoResp = await fetchWithRetry(
+            `${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`,
+            { timeout: 25000 },
+            2,
+            500,
+            config.xtreamProxyUrl
+        );
         if (!infoResp.ok) return { videos: [] };
         const infoJson = await infoResp.json();
         const videos = [];

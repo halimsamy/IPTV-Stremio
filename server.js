@@ -11,6 +11,7 @@ const createAddon = require('./addon');
 const { encryptConfig, tryParseConfigToken } = require('./cryptoConfig');
 const LRUCache = require('./lruCache');
 const { normalizeSdkResourceUrl } = require('./sdkUrlUtils');
+const { createProxyAgent, normalizeHttpProxyUrl } = require('./proxyAgent');
 
 const DEBUG = (process.env.DEBUG_MODE || '').toLowerCase() === 'true';
 function dlog(...args) {
@@ -71,12 +72,13 @@ app.post('/encrypt', (req, res) => {
 app.post('/api/prefetch', async (req, res) => {
     if (!PREFETCH_ENABLED) return res.status(403).json({ error: 'Prefetch disabled by server' });
 
-    const { url, purpose } = req.body || {};
+    const { url, purpose, proxyUrl } = req.body || {};
     if (!url || typeof url !== 'string') return res.status(400).json({ error: 'Missing url' });
     if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: 'Only http(s) URLs allowed' });
 
     try {
         const u = new URL(url);
+        let normalizedProxyUrl = '';
         const host = u.hostname;
         // Basic SSRF / local network block
         if (
@@ -91,6 +93,14 @@ app.post('/api/prefetch', async (req, res) => {
             return res.status(400).json({ error: 'Blocked host' });
         }
 
+        if (proxyUrl) {
+            try {
+                normalizedProxyUrl = normalizeHttpProxyUrl(proxyUrl);
+            } catch (error) {
+                return res.status(400).json({ error: error.message || 'Invalid proxy URL' });
+            }
+        }
+
         dlog('Prefetch start', { url, purpose });
 
         const controller = new AbortController();
@@ -101,6 +111,7 @@ app.post('/api/prefetch', async (req, res) => {
             fetched = await fetch(url, {
                 method: 'GET',
                 signal: controller.signal,
+                agent: normalizedProxyUrl ? createProxyAgent(url, normalizedProxyUrl) : undefined,
                 headers: { 'User-Agent': 'IPTV-Stremio-Addon Prefetch/1.1' }
             });
         } finally {

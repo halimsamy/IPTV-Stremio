@@ -480,6 +480,107 @@ async function runArabicNormalizationSearchTests() {
     directProvider.fetchData = originalFetchData;
 }
 
+async function runXtreamProxyRequestTests() {
+    const fetchModulePath = require.resolve('node-fetch');
+    const providerModulePath = require.resolve('../src/js/providers/xtreamProvider');
+    const originalFetchModule = require.cache[fetchModulePath];
+    const originalProviderModule = require.cache[providerModulePath];
+    const fetchCalls = [];
+
+    require.cache[fetchModulePath] = {
+        id: fetchModulePath,
+        filename: fetchModulePath,
+        loaded: true,
+        exports: async (url, options = {}) => {
+            fetchCalls.push({ url, options });
+            return {
+                ok: true,
+                json: async () => [],
+                text: async () => ''
+            };
+        }
+    };
+    delete require.cache[providerModulePath];
+
+    try {
+        const xtreamProvider = require('../src/js/providers/xtreamProvider');
+        const addonInstance = {
+            config: {
+                xtreamUrl: 'https://panel.example.com',
+                xtreamUsername: 'demo-user',
+                xtreamPassword: 'demo-pass',
+                xtreamProxyUrl: '127.0.0.1:8080',
+                enableEpg: false,
+                includeSeries: false
+            },
+            series: [],
+            parseM3U() {
+                return [];
+            },
+            parseEPG: async () => ({})
+        };
+
+        await xtreamProvider.fetchData(addonInstance);
+
+        assert.ok(fetchCalls.length >= 2, 'expected Xtream provider to issue API requests');
+        for (const call of fetchCalls) {
+            assert.ok(call.options.agent, 'expected Xtream requests to include a proxy agent');
+            assert.strictEqual(call.options.agent.constructor.name, 'HttpsProxyAgent');
+            assert.strictEqual(call.options.agent.proxy.href, 'http://127.0.0.1:8080/');
+        }
+    } finally {
+        delete require.cache[providerModulePath];
+        if (originalProviderModule) require.cache[providerModulePath] = originalProviderModule;
+        if (originalFetchModule) require.cache[fetchModulePath] = originalFetchModule;
+        else delete require.cache[fetchModulePath];
+    }
+}
+
+async function runXtreamProxyCacheKeyTests() {
+    process.env.CACHE_ENABLED = 'true';
+
+    const xtreamProvider = require('../src/js/providers/xtreamProvider');
+    const createAddon = require('../addon');
+    const originalFetchData = xtreamProvider.fetchData;
+    let fetchDataCalls = 0;
+
+    xtreamProvider.fetchData = async (addonInstance) => {
+        fetchDataCalls += 1;
+        addonInstance.channels = [];
+        addonInstance.movies = [];
+        addonInstance.series = [];
+        addonInstance.epgData = {};
+    };
+
+    try {
+        await createAddon({
+            provider: 'xtream',
+            xtreamUrl: 'http://panel.example.com:8080',
+            xtreamUsername: 'demo-user',
+            xtreamPassword: 'demo-pass',
+            xtreamProxyUrl: 'http://10.0.0.1:8080',
+            includeSeries: false,
+            enableEpg: false,
+            debug: false
+        });
+
+        await createAddon({
+            provider: 'xtream',
+            xtreamUrl: 'http://panel.example.com:8080',
+            xtreamUsername: 'demo-user',
+            xtreamPassword: 'demo-pass',
+            xtreamProxyUrl: 'http://10.0.0.2:8080',
+            includeSeries: false,
+            enableEpg: false,
+            debug: false
+        });
+
+        assert.strictEqual(fetchDataCalls, 2, 'changing xtreamProxyUrl should invalidate the addon cache key');
+    } finally {
+        xtreamProvider.fetchData = originalFetchData;
+    }
+}
+
 (async () => {
     runSdkUrlUtilsTests();
     await runAddonBuildCacheTests();
@@ -487,6 +588,8 @@ async function runArabicNormalizationSearchTests() {
     await runHomeCategoryLimitConfigTests();
     await runMetaSanitizationTests();
     await runArabicNormalizationSearchTests();
+    await runXtreamProxyRequestTests();
+    await runXtreamProxyCacheKeyTests();
     console.log('ok');
 })().catch((error) => {
     console.error(error);

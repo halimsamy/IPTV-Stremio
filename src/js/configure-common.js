@@ -244,6 +244,8 @@
             }
 
             setInputValue('enableEpg', config.enableEpg !== false);
+            setInputValue('enableXtreamProxy', !!config.xtreamProxyUrl);
+            setInputValue('xtreamProxyUrl', config.xtreamProxyUrl || '');
             setInputValue('customEpgUrl', config.epgUrl || '');
             setInputValue('epgOffsetHours', config.epgOffsetHours || '');
             const epgMode = config.epgUrl ? 'custom' : 'xtream';

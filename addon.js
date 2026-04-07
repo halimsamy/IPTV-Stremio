@@ -278,6 +278,7 @@ function createCacheKey(config) {
         enableEpg: !!config.enableEpg,
         xtreamUrl: config.xtreamUrl,
         xtreamUsername: config.xtreamUsername,
+        xtreamProxyUrl: config.xtreamProxyUrl,
         xtreamUseM3U: !!config.xtreamUseM3U,
         xtreamOutput: config.xtreamOutput,
         epgOffsetHours: config.epgOffsetHours,

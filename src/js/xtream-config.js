@@ -13,6 +13,9 @@
     const userInput = document.getElementById('xtreamUsername');
     const pwdInput = document.getElementById('xtreamPassword');
     const togglePwdBtn = document.getElementById('togglePwd');
+    const enableXtreamProxyChk = document.getElementById('enableXtreamProxy');
+    const xtreamProxyGroup = document.getElementById('xtreamProxyGroup');
+    const xtreamProxyUrlInput = document.getElementById('xtreamProxyUrl');
     const enableEpgChk = document.getElementById('enableEpg');
     const epgOffsetInput = document.getElementById('epgOffsetHours');
     const customEpgGroup = document.getElementById('customEpgGroup');
@@ -50,6 +53,10 @@
         customEpgGroup.classList.toggle('hidden', !(enableEpgChk.checked && mode === 'custom'));
     }
 
+    function syncProxyVisibility() {
+        xtreamProxyGroup.classList.toggle('hidden', !enableXtreamProxyChk.checked);
+    }
+
     if (togglePwdBtn && pwdInput) {
         togglePwdBtn.addEventListener('click', e => {
             e.preventDefault();
@@ -64,8 +71,10 @@
     }
 
     enableEpgChk.addEventListener('change', syncCustomEpgVisibility);
+    enableXtreamProxyChk.addEventListener('change', syncProxyVisibility);
     epgModeRadios().forEach(r => r.addEventListener('change', syncCustomEpgVisibility));
     syncCustomEpgVisibility();
+    syncProxyVisibility();
 
     function validateUrl(u) {
         try {
@@ -83,6 +92,29 @@
         return s;
     }
 
+    function normalizeProxyUrl(raw) {
+        if (!raw) return '';
+        let value = raw.trim();
+        if (!value) return '';
+        if (!/^[a-z]+:\/\//i.test(value)) value = `http://${value}`;
+
+        const parsed = new URL(value);
+        if (!['http:', 'https:'].includes(parsed.protocol)) {
+            throw new Error('Proxy URL must use HTTP or HTTPS');
+        }
+
+        parsed.hash = '';
+        return parsed.toString();
+    }
+
+    function validateProxyUrl(raw) {
+        try {
+            return !!normalizeProxyUrl(raw);
+        } catch {
+            return false;
+        }
+    }
+
     async function fetchTextBrowser(url, phaseLabel) {
         // Avoid mixed content fetch attempts (HTTPS page -> HTTP resource) which browsers block.
         if (window.location.protocol === 'https:' && /^http:\/\//i.test(url)) {
@@ -96,12 +128,12 @@
         return txt;
     }
 
-    async function fetchTextServer(url, purpose) {
+    async function fetchTextServer(url, purpose, proxyUrl = '') {
         appendDetail(`→ (Server) Prefetch ${purpose}: ${url}`);
         const res = await fetch('/api/prefetch', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url, purpose })
+            body: JSON.stringify({ url, purpose, proxyUrl })
         });
         let payload = {};
         try { payload = await res.json(); } catch { }
@@ -118,7 +150,11 @@
         return payload.content;
     }
 
-    async function robustFetch(url, purpose, browserFirst = true) {
+    async function robustFetch(url, purpose, browserFirst = true, proxyUrl = '') {
+        if (proxyUrl) {
+            return await fetchTextServer(url, purpose, proxyUrl);
+        }
+
         // If mixed content would occur, skip browser attempt.
         const mixed = window.location.protocol === 'https:' && /^http:\/\//i.test(url);
         if (browserFirst && !mixed) {
@@ -128,7 +164,7 @@
                 appendDetail(`⚠ Browser fetch failed (${e.message}) → server fallback`);
             }
         }
-        return await fetchTextServer(url, purpose);
+        return await fetchTextServer(url, purpose, proxyUrl);
     }
 
     function quickEpgStats(xml) {
@@ -164,10 +200,13 @@
         const baseUrl = normalizedBaseUrl(baseUrlRaw);
         const username = userInput.value.trim();
         let password = pwdInput.value;
+        const enableProxy = enableXtreamProxyChk.checked;
+        const proxyUrlRaw = enableProxy ? xtreamProxyUrlInput.value.trim() : '';
         const enableEpgInitial = enableEpgChk.checked;
         const epgMode = enableEpgInitial ? selectedEpgMode() : 'disabled';
         const customEpg = (epgMode === 'custom') ? customEpgUrlInp.value.trim() : '';
         const epgOffset = epgOffsetInput.value ? parseFloat(epgOffsetInput.value) : 0;
+        let proxyUrl = '';
         if (!validateUrl(baseUrl)) {
             alert('Invalid Xtream base URL');
             return;
@@ -178,6 +217,18 @@
         }
         if (password === '********' && pwdInput.dataset.original) {
             password = pwdInput.dataset.original;
+        }
+
+        if (enableProxy) {
+            if (!proxyUrlRaw) {
+                alert('Proxy URL is empty');
+                return;
+            }
+            if (!validateProxyUrl(proxyUrlRaw)) {
+                alert('Invalid proxy URL');
+                return;
+            }
+            proxyUrl = normalizeProxyUrl(proxyUrlRaw);
         }
 
         if (epgMode === 'custom' && enableEpgInitial) {
@@ -198,6 +249,7 @@
         appendDetail('== PRE-FLIGHT (XTREAM) ==');
         appendDetail(`Base URL: ${baseUrl}`);
         appendDetail(`Mode: 'JSON API'}`);
+        appendDetail(`HTTP Proxy: ${proxyUrl || 'Disabled'}`);
         appendDetail(`EPG Mode: ${enableEpgInitial ? (epgMode === 'custom' ? 'Custom URL' : 'Panel XMLTV') : 'Disabled'}`);
         let enableEpgFinal = enableEpgInitial;
         try {
@@ -211,10 +263,10 @@
             setProgress(12, 'Fetching Live Streams');
             let liveJsonText;
             try {
-                liveJsonText = await robustFetch(`${base}&action=get_live_streams`, 'live_streams', true);
+                liveJsonText = await robustFetch(`${base}&action=get_live_streams`, 'live_streams', true, proxyUrl);
             } catch (lErr) {
                 appendDetail(`⚠ Live streams browser fetch failed: ${lErr.message}`);
-                liveJsonText = await robustFetch(`${base}&action=get_live_streams`, 'live_streams', false);
+                liveJsonText = await robustFetch(`${base}&action=get_live_streams`, 'live_streams', false, proxyUrl);
             }
             let liveList = [];
             try { liveList = JSON.parse(liveJsonText); } catch { throw new Error('Failed to parse live streams JSON'); }
@@ -224,10 +276,10 @@
             setProgress(28, 'Fetching VOD Streams');
             let vodJsonText;
             try {
-                vodJsonText = await robustFetch(`${base}&action=get_vod_streams`, 'vod_streams', true);
+                vodJsonText = await robustFetch(`${base}&action=get_vod_streams`, 'vod_streams', true, proxyUrl);
             } catch (vErr) {
                 appendDetail(`⚠ VOD browser fetch failed: ${vErr.message}`);
-                vodJsonText = await robustFetch(`${base}&action=get_vod_streams`, 'vod_streams', false);
+                vodJsonText = await robustFetch(`${base}&action=get_vod_streams`, 'vod_streams', false, proxyUrl);
             }
             let vodList = [];
             try { vodList = JSON.parse(vodJsonText); } catch { throw new Error('Failed to parse VOD streams JSON'); }
@@ -258,10 +310,10 @@
                 let epgTxt = null;
                 try {
                     try {
-                        epgTxt = await robustFetch(epgSourceUrl, 'epg', true);
+                        epgTxt = await robustFetch(epgSourceUrl, 'epg', true, proxyUrl);
                     } catch (firstEpgErr) {
                         appendDetail(`⚠ EPG browser fetch failed: ${firstEpgErr.message} → server fallback`);
-                        epgTxt = await robustFetch(epgSourceUrl, 'epg', false);
+                        epgTxt = await robustFetch(epgSourceUrl, 'epg', false, proxyUrl);
                     }
                 } catch (finalEpgErr) {
                     appendDetail(`✖ EPG fetch failed after both attempts (${finalEpgErr.message}) – continuing WITHOUT EPG`);
@@ -285,6 +337,8 @@
                 xtreamPassword: password,
                 enableEpg: enableEpgFinal
             };
+
+            if (proxyUrl) config.xtreamProxyUrl = proxyUrl;
 
             if (enableEpgFinal && epgMode === 'custom' && customEpgUrlInp.value.trim()) {
                 config.epgUrl = customEpgUrlInp.value.trim();
