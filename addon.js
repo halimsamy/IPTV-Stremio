@@ -28,6 +28,47 @@ const ADDON_NAME = "M3U/EPG TV Addon";
 const ADDON_ID = "org.stremio.m3u-epg-addon";
 
 const DEBUG_ENV = (process.env.DEBUG_MODE || '').toLowerCase() === 'true';
+
+const ALL_GENRE_LABELS = new Set([
+    'all',
+    'all channels',
+    'all movies',
+    'all series'
+]);
+
+function normalizeSearchText(value) {
+    return (value || '')
+        .toString()
+        .normalize('NFKD')
+        .replace(/\p{M}/gu, '')
+        .replace(/[أإآ]/g, 'ا')
+        .replace(/ة/g, 'ه')
+        .replace(/ى/g, 'ي')
+        .replace(/[^\p{L}\p{N}]+/gu, ' ')
+        .trim()
+        .toLowerCase();
+}
+
+function extractYear(value) {
+    if (typeof value === 'number' && Number.isInteger(value) && value > 0) return value;
+    const match = String(value || '').match(/\b(19|20)\d{2}\b/);
+    return match ? parseInt(match[0], 10) : null;
+}
+
+function normalizeReleasedValue(value, fallbackYear) {
+    const raw = String(value || '').trim();
+    if (raw) {
+        const parsed = new Date(raw);
+        if (!Number.isNaN(parsed.getTime())) return parsed.toISOString();
+        const year = extractYear(raw);
+        if (year) return `${year}-01-01T00:00:00.000Z`;
+    }
+
+    const year = extractYear(fallbackYear);
+    if (year) return `${year}-01-01T00:00:00.000Z`;
+    return '1970-01-01T00:00:00.000Z';
+}
+
 function makeLogger(cfgDebug) {
     const enabled = !!cfgDebug || DEBUG_ENV;
     return {
@@ -93,9 +134,15 @@ class M3UEPGAddon {
         this.channels = []; // live TV
         this.movies = [];   // VOD movies
         this.series = [];   // Series (shows)
+        this.searchIndex = {
+            tv: [],
+            movie: [],
+            series: []
+        };
         this.seriesInfoCache = new Map(); // seriesId -> { videos: [...], fetchedAt }
         this.epgData = {};
         this.lastUpdate = 0;
+        this.updatePromise = null;
         this.log = makeLogger(config.debug);
 
         // Direct provider may populate this (seriesId -> episodes array)
@@ -120,6 +167,34 @@ class M3UEPGAddon {
         });
     }
 
+    hasData() {
+        return !!(this.channels.length || this.movies.length || this.series.length);
+    }
+
+    rebuildSearchIndex() {
+        const buildIndex = (items) => items.map(item => {
+            const nameNorm = normalizeSearchText(item.name);
+            const haystack = [
+                item.name,
+                item.category,
+                item.plot,
+                item.attributes?.['group-title'],
+                item.attributes?.['plot']
+            ].map(normalizeSearchText).filter(Boolean).join(' ');
+            return {
+                item,
+                name: nameNorm,
+                nameTokens: nameNorm.split(' ').filter(Boolean),
+                haystack,
+                haystackTokens: haystack.split(' ').filter(Boolean)
+            };
+        });
+
+        this.searchIndex.tv = buildIndex(this.channels);
+        this.searchIndex.movie = buildIndex(this.movies);
+        this.searchIndex.series = buildIndex(this.series);
+    }
+
     async loadFromCache() {
         if (!CACHE_ENABLED) return;
         const cacheKey = 'addon:data:' + this.cacheKey;
@@ -134,6 +209,7 @@ class M3UEPGAddon {
             this.series = cached.series || [];
             this.epgData = cached.epgData || {};
             this.lastUpdate = cached.lastUpdate || 0;
+            this.rebuildSearchIndex();
             // Direct series episodes index is not persisted; rebuild on next fetch
             this.log.debug('Cache hit for data', {
                 channels: this.channels.length,
@@ -187,6 +263,7 @@ class M3UEPGAddon {
                         .map(s => s.trim())
                 )
             ].sort((a, b) => a.localeCompare(b));
+            if (!movieGroups.includes('All Movies')) movieGroups.unshift('All Movies');
             movieCatalog.genres = movieGroups;
         }
 
@@ -199,6 +276,7 @@ class M3UEPGAddon {
                         .map(s => s.trim())
                 )
             ].sort((a, b) => a.localeCompare(b));
+            if (!seriesGroups.includes('All Series')) seriesGroups.unshift('All Series');
             seriesCatalog.genres = seriesGroups;
         }
 
@@ -207,6 +285,55 @@ class M3UEPGAddon {
             movieGenres: movieCatalog?.genres?.length || 0,
             seriesGenres: seriesCatalog?.genres?.length || 0
         });
+    }
+
+    shouldFilterGenre(genre) {
+        if (!genre) return false;
+        return !ALL_GENRE_LABELS.has(normalizeSearchText(genre));
+    }
+
+    matchesSearch(item, rawQuery) {
+        const nameNorm = normalizeSearchText(item.name);
+        const haystack = [item.name, item.category, item.plot, item.attributes?.['group-title'], item.attributes?.['plot']]
+            .map(normalizeSearchText).filter(Boolean).join(' ');
+        return this.matchesSearchEntry({
+            item, name: nameNorm, nameTokens: nameNorm.split(' ').filter(Boolean),
+            haystack, haystackTokens: haystack.split(' ').filter(Boolean)
+        }, normalizeSearchText(rawQuery).split(' ').filter(Boolean));
+    }
+
+    matchesSearchEntry(entry, queryTerms) {
+        if (!queryTerms || !queryTerms.length) return true;
+        return queryTerms.every(term => entry.haystack.includes(term));
+    }
+
+    rankSearchResult(item, rawQuery) {
+        const nameNorm = normalizeSearchText(item.name);
+         const haystack = [item.name, item.category, item.plot, item.attributes?.['group-title'], item.attributes?.['plot']]
+            .map(normalizeSearchText).filter(Boolean).join(' ');
+        const entry = {
+            item, name: nameNorm, nameTokens: nameNorm.split(' ').filter(Boolean),
+            haystack, haystackTokens: haystack.split(' ').filter(Boolean)
+        };
+        const query = normalizeSearchText(rawQuery);
+        return this.rankSearchEntry(entry, query, query.split(' ').filter(Boolean));
+    }
+
+    rankSearchEntry(entry, query, terms) {
+        if (!query || !terms || !terms.length) return 99;
+        
+        const { name, haystack, nameTokens, haystackTokens } = entry;
+
+        if (name === query) return 0;
+        if (haystack === query) return 1;
+        if (name.startsWith(query)) return 2;
+        
+        if (terms.every(term => nameTokens.includes(term))) return 3;
+        if (terms.every(term => haystackTokens.includes(term))) return 4;
+        if (terms.every(term => name.includes(term))) return 5;
+        if (terms.every(term => haystack.includes(term))) return 6;
+        
+        return 7;
     }
 
     parseM3U(content) {
@@ -370,19 +497,21 @@ class M3UEPGAddon {
             const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
             if (typeof providerModule.fetchSeriesInfo === 'function') {
                 const info = await providerModule.fetchSeriesInfo(this, seriesId);
-                this.seriesInfoCache.set(seriesId, info);
+                if (info && (Array.isArray(info.videos) ? info.videos.length > 0 : true)) {
+                    this.seriesInfoCache.set(seriesId, info);
+                }
                 return info;
             }
         } catch (e) {
             this.log.warn('Series info fetch failed', seriesId, e.message);
         }
         // Fallback empty structure
-        const empty = { videos: [] };
-        this.seriesInfoCache.set(seriesId, empty);
-        return empty;
+        return { videos: [] };
     }
 
-    async updateData(force = false) {
+    async updateData(force = false, throwOnError = false) {
+        if (this.updatePromise) return this.updatePromise;
+
         const now = Date.now();
         if (!force && CACHE_ENABLED) {
             if (this.lastUpdate && now - this.lastUpdate < this.updateInterval) {
@@ -394,22 +523,45 @@ class M3UEPGAddon {
                 return;
             }
         }
-        try {
+        const previousState = {
+            channels: this.channels,
+            movies: this.movies,
+            series: this.series,
+            epgData: this.epgData,
+            directSeriesEpisodeIndex: new Map(this.directSeriesEpisodeIndex)
+        };
+
+        this.updatePromise = (async () => {
             const start = Date.now();
-            const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
-            await providerModule.fetchData(this);
-            this.lastUpdate = Date.now();
-            if (CACHE_ENABLED) await this.saveToCache();
-            this.buildGenresInManifest();
-            this.log.debug('Data update complete', {
-                channels: this.channels.length,
-                movies: this.movies.length,
-                series: this.series.length,
-                ms: Date.now() - start
-            });
-        } catch (e) {
-            this.log.error('[UPDATE] Failed:', e.message);
-        }
+            try {
+                const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
+                await providerModule.fetchData(this);
+                this.lastUpdate = Date.now();
+                this.rebuildSearchIndex();
+                if (CACHE_ENABLED) await this.saveToCache();
+                this.buildGenresInManifest();
+                this.log.debug('Data update complete', {
+                    channels: this.channels.length,
+                    movies: this.movies.length,
+                    series: this.series.length,
+                    ms: Date.now() - start
+                });
+            } catch (e) {
+                this.channels = previousState.channels;
+                this.movies = previousState.movies;
+                this.series = previousState.series;
+                this.epgData = previousState.epgData;
+                this.directSeriesEpisodeIndex = previousState.directSeriesEpisodeIndex;
+                this.rebuildSearchIndex();
+                this.buildGenresInManifest();
+                this.log.error('[UPDATE] Failed:', e.message);
+                if (throwOnError) throw e;
+            } finally {
+                this.updatePromise = null;
+            }
+        })();
+
+        return this.updatePromise;
     }
 
     deriveFallbackLogoUrl(item) {
@@ -497,12 +649,17 @@ class M3UEPGAddon {
     async buildSeriesMeta(seriesItem) {
         const seriesIdRaw = seriesItem.series_id || seriesItem.id.replace(/^iptv_series_/, '');
         const info = await this.ensureSeriesInfo(seriesIdRaw);
+        const seriesInfo = info?.info || {};
+        const backdrop = Array.isArray(seriesInfo.backdrop_path)
+            ? seriesInfo.backdrop_path.find(Boolean)
+            : seriesInfo.backdrop_path;
+        const fallbackReleaseYear = seriesInfo.releaseDate || seriesItem.year || seriesItem.name;
         const videos = (info?.videos || []).map(v => ({
             id: v.id,
             title: v.title,
             season: v.season,
             episode: v.episode,
-            released: v.released || null,
+            released: normalizeReleasedValue(v.released, fallbackReleaseYear),
             thumbnail: v.thumbnail || seriesItem.poster || seriesItem.attributes?.['tvg-logo']
         }));
 
@@ -511,12 +668,15 @@ class M3UEPGAddon {
             type: 'series',
             name: seriesItem.name,
             poster: seriesItem.poster ||
+                seriesInfo.cover ||
                 seriesItem.attributes?.['tvg-logo'] ||
                 `https://via.placeholder.com/300x450/3366CC/FFFFFF?text=${encodeURIComponent(seriesItem.name)}`,
-            description: seriesItem.plot || seriesItem.attributes?.['plot'] || 'Series / Show',
+            background: backdrop || undefined,
+            description: seriesItem.plot || seriesInfo.plot || seriesItem.attributes?.['plot'] || 'Series / Show',
             genres: seriesItem.category
                 ? [seriesItem.category]
                 : (seriesItem.attributes?.['group-title'] ? [seriesItem.attributes['group-title']] : ['Series']),
+            releaseInfo: seriesInfo.releaseDate ? String(seriesInfo.releaseDate).slice(0, 4) : undefined,
             videos
         };
     }
@@ -597,22 +757,43 @@ async function createAddon(config) {
                 type: 'tv',
                 id: 'iptv_channels',
                 name: 'IPTV Channels',
-                extra: [{ name: 'genre' }, { name: 'search' }, { name: 'skip' }],
+                extra: [{ name: 'genre' }, { name: 'skip' }],
+                genres: []
+            },
+            {
+                type: 'tv',
+                id: 'iptv_channels_search',
+                name: 'Search Channels',
+                extra: [{ name: 'search', isRequired: true }],
                 genres: []
             },
             {
                 type: 'movie',
                 id: 'iptv_movies',
                 name: 'IPTV Movies',
-                extra: [{ name: 'search' }, { name: 'skip' }],
+                extra: [{ name: 'skip' }],
+                genres: []
+            },
+            {
+                type: 'movie',
+                id: 'iptv_movies_search',
+                name: 'Search Movies',
+                extra: [{ name: 'search', isRequired: true }],
                 genres: []
             },
             {
                 type: 'series',
                 id: 'iptv_series',
                 name: 'IPTV Series',
-                extra: [{ name: 'genre' }, { name: 'search' }, { name: 'skip' }],
+                extra: [{ name: 'genre' }, { name: 'skip' }],
                 genres: []
+            },
+            {
+                type: 'series',
+                id: 'iptv_series_search',
+                name: 'Search Series',
+                extra: [{ name: 'search', isRequired: true }],
+                genres: [] // Will not be populated or used
             }
         ],
         idPrefixes: ["iptv_"],
@@ -642,34 +823,60 @@ async function createAddon(config) {
         const builder = new addonBuilder(manifest);
         const addonInstance = new M3UEPGAddon(config, manifest);
         await addonInstance.loadFromCache();
-        await addonInstance.updateData(true);
         addonInstance.buildGenresInManifest();
+        if (addonInstance.hasData()) {
+            addonInstance.updateData().catch(() => { });
+        } else {
+            await addonInstance.updateData(true, true);
+        }
 
         builder.defineCatalogHandler(async (args) => {
             const start = Date.now();
             try {
                 addonInstance.updateData().catch(() => { });
                 let items = [];
-                if (args.type === 'tv' && args.id === 'iptv_channels') {
+                const isSearchCatalog = args.id.endsWith('_search');
+                if (args.type === 'tv' && (args.id === 'iptv_channels' || args.id === 'iptv_channels_search')) {
                     items = addonInstance.channels;
-                } else if (args.type === 'movie' && args.id === 'iptv_movies') {
+                } else if (args.type === 'movie' && (args.id === 'iptv_movies' || args.id === 'iptv_movies_search')) {
                     items = addonInstance.movies;
-                } else if (args.type === 'series' && args.id === 'iptv_series') {
+                } else if (args.type === 'series' && (args.id === 'iptv_series' || args.id === 'iptv_series_search')) {
                     if (addonInstance.config.includeSeries !== false)
                         items = addonInstance.series;
                 }
                 const extra = args.extra || {};
-                if (extra.genre && extra.genre !== 'All Channels') {
+                if (!isSearchCatalog && addonInstance.shouldFilterGenre(extra.genre)) {
                     items = items.filter(i =>
                         (i.category && i.category === extra.genre) ||
                         (i.attributes && i.attributes['group-title'] === extra.genre)
                     );
                 }
                 if (extra.search) {
-                    const q = extra.search.toLowerCase();
-                    items = items.filter(i => i.name.toLowerCase().includes(q));
+                    const searchBucket = args.type === 'tv'
+                        ? addonInstance.searchIndex.tv
+                        : args.type === 'movie'
+                            ? addonInstance.searchIndex.movie
+                            : addonInstance.searchIndex.series;
+                    
+                    const query = normalizeSearchText(extra.search);
+                    const terms = query.split(' ').filter(Boolean);
+
+                    items = searchBucket
+                        .filter(entry => addonInstance.matchesSearchEntry(entry, terms))
+                        .map(entry => ({
+                            entry,
+                            rank: addonInstance.rankSearchEntry(entry, query, terms)
+                        }))
+                        .sort((a, b) =>
+                            a.rank - b.rank ||
+                            a.entry.item.name.localeCompare(b.entry.item.name)
+                        )
+                        .map(obj => obj.entry.item);
+                } else if (isSearchCatalog) {
+                    return { metas: [] };
                 }
-                const metas = items.slice(0, 200).map(i => addonInstance.generateMetaPreview(i));
+                const skip = Math.max(parseInt(extra.skip || '0', 10) || 0, 0);
+                const metas = items.slice(skip, skip + 100).map(i => addonInstance.generateMetaPreview(i));
                 if (addonInstance.config.debug) {
                     console.log('[DEBUG] Catalog handler', {
                         type: args.type,
@@ -735,8 +942,11 @@ async function createAddon(config) {
     try {
         const iface = await buildPromise;
         return iface;
+    } catch (error) {
+        if (CACHE_ENABLED) buildPromiseCache.delete(cacheKey);
+        throw error;
     } finally {
-        // Keep promise cached
+        // Successful builds stay cached via buildPromiseCache.
     }
 }
 
