@@ -757,43 +757,22 @@ async function createAddon(config) {
                 type: 'tv',
                 id: 'iptv_channels',
                 name: 'IPTV Channels',
-                extra: [{ name: 'genre' }, { name: 'skip' }],
-                genres: []
-            },
-            {
-                type: 'tv',
-                id: 'iptv_channels_search',
-                name: 'Search Channels',
-                extra: [{ name: 'search', isRequired: true }],
+                extra: [{ name: 'search' }, { name: 'genre' }, { name: 'skip' }],
                 genres: []
             },
             {
                 type: 'movie',
                 id: 'iptv_movies',
                 name: 'IPTV Movies',
-                extra: [{ name: 'skip' }],
-                genres: []
-            },
-            {
-                type: 'movie',
-                id: 'iptv_movies_search',
-                name: 'Search Movies',
-                extra: [{ name: 'search', isRequired: true }],
+                extra: [{ name: 'search' }, { name: 'genre' }, { name: 'skip' }],
                 genres: []
             },
             {
                 type: 'series',
                 id: 'iptv_series',
                 name: 'IPTV Series',
-                extra: [{ name: 'genre' }, { name: 'skip' }],
+                extra: [{ name: 'search' }, { name: 'genre' }, { name: 'skip' }],
                 genres: []
-            },
-            {
-                type: 'series',
-                id: 'iptv_series_search',
-                name: 'Search Series',
-                extra: [{ name: 'search', isRequired: true }],
-                genres: [] // Will not be populated or used
             }
         ],
         idPrefixes: ["iptv_"],
@@ -835,17 +814,16 @@ async function createAddon(config) {
             try {
                 addonInstance.updateData().catch(() => { });
                 let items = [];
-                const isSearchCatalog = args.id.endsWith('_search');
-                if (args.type === 'tv' && (args.id === 'iptv_channels' || args.id === 'iptv_channels_search')) {
+                if (args.type === 'tv' && args.id === 'iptv_channels') {
                     items = addonInstance.channels;
-                } else if (args.type === 'movie' && (args.id === 'iptv_movies' || args.id === 'iptv_movies_search')) {
+                } else if (args.type === 'movie' && args.id === 'iptv_movies') {
                     items = addonInstance.movies;
-                } else if (args.type === 'series' && (args.id === 'iptv_series' || args.id === 'iptv_series_search')) {
+                } else if (args.type === 'series' && args.id === 'iptv_series') {
                     if (addonInstance.config.includeSeries !== false)
                         items = addonInstance.series;
                 }
                 const extra = args.extra || {};
-                if (!isSearchCatalog && addonInstance.shouldFilterGenre(extra.genre)) {
+                if (addonInstance.shouldFilterGenre(extra.genre) && !extra.search) {
                     items = items.filter(i =>
                         (i.category && i.category === extra.genre) ||
                         (i.attributes && i.attributes['group-title'] === extra.genre)
@@ -872,8 +850,6 @@ async function createAddon(config) {
                             a.entry.item.name.localeCompare(b.entry.item.name)
                         )
                         .map(obj => obj.entry.item);
-                } else if (isSearchCatalog) {
-                    return { metas: [] };
                 }
                 const skip = Math.max(parseInt(extra.skip || '0', 10) || 0, 0);
                 const metas = items.slice(skip, skip + 100).map(i => addonInstance.generateMetaPreview(i));
