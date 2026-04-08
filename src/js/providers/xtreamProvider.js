@@ -123,10 +123,10 @@ async function fetchData(addonInstance) {
         const base = `${xtreamUrl}/player_api.php?username=${encodeURIComponent(xtreamUsername)}&password=${encodeURIComponent(xtreamPassword)}`;
         // Fetch streams + category lists in parallel to map category_id -> category_name
         const [liveResp, vodResp, liveCatsResp, vodCatsResp] = await Promise.all([
-            fetchWithRetry(`${base}&action=get_live_streams`, { timeout: 60000 }, 2, 500, xtreamProxyUrl),
-            fetchWithRetry(`${base}&action=get_vod_streams`, { timeout: 60000 }, 2, 500, xtreamProxyUrl),
-            fetchWithRetry(`${base}&action=get_live_categories`, { timeout: 30000 }, 2, 500, xtreamProxyUrl).catch(() => null),
-            fetchWithRetry(`${base}&action=get_vod_categories`, { timeout: 30000 }, 2, 500, xtreamProxyUrl).catch(() => null)
+            fetchWithRetry(`${base}&action=get_live_streams`, { timeout: 600000 }, 2, 500, xtreamProxyUrl),
+            fetchWithRetry(`${base}&action=get_vod_streams`, { timeout: 600000 }, 2, 500, xtreamProxyUrl),
+            fetchWithRetry(`${base}&action=get_live_categories`, { timeout: 300000 }, 2, 500, xtreamProxyUrl).catch(() => null),
+            fetchWithRetry(`${base}&action=get_vod_categories`, { timeout: 300000 }, 2, 500, xtreamProxyUrl).catch(() => null)
         ]);
 
         if (!liveResp.ok) throw new Error('Xtream live streams fetch failed');
